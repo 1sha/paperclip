@@ -75,6 +75,11 @@ const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+const RETRYABLE_GATEWAY_TRANSPORT_ERROR_CODES = new Set([
+  "hermes_gateway_transport_error",
+  "hermes_gateway_unhealthy",
+  "hermes_gateway_timeout",
+]);
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -2241,6 +2246,122 @@ export function heartbeatService(db: Db) {
     return queued;
   }
 
+  function shouldQueueGatewayTransportRetry(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    adapterResult: AdapterExecutionResult,
+  ) {
+    if (agent.adapterType !== "hermes_local") return false;
+    if ((run.processLossRetryCount ?? 0) >= 1) return false;
+    const errorCode = readNonEmptyString(adapterResult.errorCode);
+    if (!errorCode || !RETRYABLE_GATEWAY_TRANSPORT_ERROR_CODES.has(errorCode)) return false;
+    const resultJson = parseObject(adapterResult.resultJson);
+    return readNonEmptyString(resultJson.transport) === "gateway_api";
+  }
+
+  async function enqueueGatewayTransportRetry(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    now: Date,
+  ) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
+    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    const retryContextSnapshot = {
+      ...contextSnapshot,
+      retryOfRunId: run.id,
+      wakeReason: "gateway_transport_retry",
+      retryReason: "gateway_transport",
+    };
+
+    const queued = await db.transaction(async (tx) => {
+      const wakeupRequest = await tx
+        .insert(agentWakeupRequests)
+        .values({
+          companyId: run.companyId,
+          agentId: run.agentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "gateway_transport_retry",
+          payload: {
+            ...(issueId ? { issueId } : {}),
+            retryOfRunId: run.id,
+          },
+          status: "queued",
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      const retryRun = await tx
+        .insert(heartbeatRuns)
+        .values({
+          companyId: run.companyId,
+          agentId: run.agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "queued",
+          wakeupRequestId: wakeupRequest.id,
+          contextSnapshot: retryContextSnapshot,
+          sessionIdBefore: sessionBefore,
+          retryOfRunId: run.id,
+          processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
+          updatedAt: now,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      await tx
+        .update(agentWakeupRequests)
+        .set({
+          runId: retryRun.id,
+          updatedAt: now,
+        })
+        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+      if (issueId) {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: retryRun.id,
+            executionAgentNameKey: normalizeAgentNameKey(agent.name),
+            executionLockedAt: now,
+            updatedAt: now,
+          })
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
+      }
+
+      return retryRun;
+    });
+
+    publishLiveEvent({
+      companyId: queued.companyId,
+      type: "heartbeat.run.queued",
+      payload: {
+        runId: queued.id,
+        agentId: queued.agentId,
+        invocationSource: queued.invocationSource,
+        triggerDetail: queued.triggerDetail,
+        wakeupRequestId: queued.wakeupRequestId,
+      },
+    });
+
+    await appendRunEvent(queued, 1, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: "Queued automatic retry after gateway_api transport failure",
+      payload: {
+        retryOfRunId: run.id,
+      },
+    });
+
+    return queued;
+  }
+
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
     const heartbeat = parseObject(runtimeConfig.heartbeat);
@@ -3419,6 +3540,10 @@ export function heartbeatService(db: Db) {
       });
 
       const finalizedRun = await getRun(run.id);
+      const gatewayRetryRun =
+        finalizedRun && outcome === "failed" && shouldQueueGatewayTransportRetry(finalizedRun, agent, adapterResult)
+          ? await enqueueGatewayTransportRetry(finalizedRun, agent, new Date())
+          : null;
       if (finalizedRun) {
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
@@ -3444,7 +3569,20 @@ export function heartbeatService(db: Db) {
           }
         }
         await finalizeIssueCommentPolicy(finalizedRun, agent);
-        await releaseIssueExecutionAndPromote(finalizedRun);
+        if (gatewayRetryRun) {
+          await appendRunEvent(finalizedRun, seq++, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "Queued one automatic retry after gateway_api transport failure",
+            payload: {
+              retryRunId: gatewayRetryRun.id,
+              retryReason: "gateway_transport",
+            },
+          });
+        } else {
+          await releaseIssueExecutionAndPromote(finalizedRun);
+        }
       }
 
       if (finalizedRun) {
@@ -3470,6 +3608,9 @@ export function heartbeatService(db: Db) {
             });
           }
         }
+      }
+      if (gatewayRetryRun) {
+        await startNextQueuedRunForAgent(agent.id);
       }
       await finalizeAgentStatus(agent.id, outcome);
     } catch (err) {
