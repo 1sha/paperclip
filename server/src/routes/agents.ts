@@ -2221,7 +2221,10 @@ export function agentRoutes(db: Db) {
     assertCompanyAccess(req, companyId);
     const agentId = req.query.agentId as string | undefined;
     const limitParam = req.query.limit as string | undefined;
-    const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
+    const parsedLimit = limitParam ? parseInt(limitParam, 10) : NaN;
+    const limit = Number.isFinite(parsedLimit)
+      ? Math.max(1, Math.min(1000, parsedLimit))
+      : 100;
     const runs = await heartbeat.list(companyId, agentId, limit);
     res.json(runs);
   });

@@ -29,11 +29,13 @@ export interface LiveRunForIssue {
   issueId?: string | null;
 }
 
+export const DEFAULT_HEARTBEAT_LIST_LIMIT = 100;
+
 export const heartbeatsApi = {
-  list: (companyId: string, agentId?: string, limit?: number) => {
+  list: (companyId: string, agentId?: string, limit: number = DEFAULT_HEARTBEAT_LIST_LIMIT) => {
     const searchParams = new URLSearchParams();
     if (agentId) searchParams.set("agentId", agentId);
-    if (limit) searchParams.set("limit", String(limit));
+    if (Number.isFinite(limit) && limit > 0) searchParams.set("limit", String(limit));
     const qs = searchParams.toString();
     return api.get<HeartbeatRun[]>(`/companies/${companyId}/heartbeat-runs${qs ? `?${qs}` : ""}`);
   },
